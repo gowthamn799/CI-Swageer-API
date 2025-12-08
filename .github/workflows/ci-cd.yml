@@ -1,0 +1,104 @@
+name: CI-CD
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  # Daily schedule (01:00 UTC ≈ 06:30 IST)
+  schedule:
+    - cron: "0 1 * * *"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: maven
+
+      - name: Run Maven tests
+        run: mvn -B test
+
+      - name: Upload Allure results
+        if: always()      # run even if tests fail
+        uses: actions/upload-artifact@v4
+        with:
+          name: allure-results
+          path: target/allure-results
+          if-no-files-found: ignore
+
+  # CD: generate Allure report and publish to GitHub Pages
+  deploy-report:
+    needs: test
+    if: always()          # still create/update report even on failure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download Allure results artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: allure-results
+          path: allure-results
+
+      - name: Install Allure CLI
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jre
+          curl -o allure-commandline.zip -Ls https://github.com/allure-framework/allure2/releases/download/2.29.0/allure-commandline-2.29.0.zip
+          unzip allure-commandline.zip -d /opt/allure
+          sudo ln -s /opt/allure/allure-2.29.0/bin/allure /usr/local/bin/allure
+
+      - name: Generate Allure report
+        run: |
+          allure generate allure-results -o allure-report --clean
+
+      - name: Deploy Allure report to GitHub Pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./allure-report
+
+  # Email job: send summary + link to report
+  email-report:
+    needs: [test, deploy-report]
+    if: always()          # send email even if tests fail
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Prepare email body
+        id: prep-mail
+        run: |
+          echo "STATUS=$( [ '${{ needs.test.result }}' = 'success' ] && echo 'PASSED' || echo 'FAILED' )" >> $GITHUB_OUTPUT
+          echo "REPORT_URL=https://$(echo '${{ github.repository }}' | sed 's/ /-/g' | tr '[:upper:]' '[:lower:]').github.io/$(echo '${{ github.event.repository.name }}' | sed 's/ /-/g')" >> $GITHUB_OUTPUT
+
+      - name: Send email
+        uses: dawidd6/action-send-mail@v3
+        with:
+          server_address: ${{ secrets.SMTP_SERVER }}
+          server_port: ${{ secrets.SMTP_PORT }}
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: "Swagger_API_Automation: ${{ steps.prep-mail.outputs.STATUS }} - ${{ github.ref_name }} (${{
+            github.run_id }})"
+          to: ${{ secrets.REPORT_TO_EMAIL }}
+          from: ${{ secrets.REPORT_FROM_EMAIL }}
+          content_type: text/html
+          body: |
+            <h2>Swagger_API_Automation – CI/CD Summary</h2>
+            <p><b>Status:</b> ${{ steps.prep-mail.outputs.STATUS }}</p>
+            <p><b>Branch:</b> ${{ github.ref_name }}</p>
+            <p><b>Workflow run:</b> <a href="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}">View in GitHub Actions</a></p>
+            <p><b>Allure Report:</b> <a href="${{ steps.prep-mail.outputs.REPORT_URL }}">Open Report</a></p>
+            <hr />
+            <p>This email was sent automatically from GitHub Actions.</p>
